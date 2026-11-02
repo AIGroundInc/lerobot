@@ -84,7 +84,7 @@ from ..utils import (
     populate_queues,
 )
 from .configuration_smolvla import SmolVLAConfig
-from .smolvlm_with_expert import SmolVLMWithExpertModel
+from .smolvlm_with_expert import SmolVLMWithExpertModel, SpatialKV
 
 
 def normalize(x, min_val, max_val):
@@ -478,7 +478,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            # The bypass starts from a random key and a zero value projection, so train it fully
+            "modules_to_save": ["spatial_bypass"] if self.config.spatial_bypass else [],
         }
 
     def _validate_peft_config(self, peft_config) -> None:
@@ -557,6 +558,10 @@ class VLAFlowMatching(nn.Module):
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
+            spatial_bypass=self.config.spatial_bypass,
+            spatial_pool_size=self.config.spatial_pool_size,
+            spatial_gate_init=self.config.spatial_gate_init,
+            spatial_num_cameras=self.config.num_spatial_cameras if self.config.spatial_bypass else 1,
         )
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
@@ -603,14 +608,18 @@ class VLAFlowMatching(nn.Module):
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, SpatialKV | None]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for SmolVLM transformer processing.
+        for SmolVLM transformer processing. With the spatial bypass, also return the keys/values of the pooled
+        SigLIP patches for the expert's cross-attention layers (None otherwise).
         """
         embs = []
         pad_masks = []
         att_masks = []
-        for _img_idx, (
+        spatial_bypass = self.vlm_with_expert.spatial_bypass
+        spatial_embs = []
+        spatial_pad_masks = []
+        for img_idx, (
             img,
             img_mask,
         ) in enumerate(zip(images, img_masks, strict=False)):
@@ -629,8 +638,14 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
 
-            img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
+            if spatial_bypass is not None and img_idx < spatial_bypass.num_cameras:
+                patches = self.vlm_with_expert.encode_image(img)
+                img_emb = self.vlm_with_expert.get_vlm_model().connector(patches)
+                spatial_emb = spatial_bypass.embed_patches(patches, img_idx)
+                spatial_embs.append(spatial_emb)
+                spatial_pad_masks.append(img_mask[:, None].expand(*spatial_emb.shape[:2]))
+            else:
+                img_emb = self.vlm_with_expert.embed_image(img)
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
@@ -693,7 +708,11 @@ class VLAFlowMatching(nn.Module):
 
         att_masks = att_masks.expand(bsize, -1)
 
-        return embs, pad_masks, att_masks
+        spatial_kv = None
+        if spatial_bypass is not None and spatial_embs:
+            spatial_kv = spatial_bypass(torch.cat(spatial_embs, dim=1), torch.cat(spatial_pad_masks, dim=1))
+
+        return embs, pad_masks, att_masks, spatial_kv
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -749,7 +768,7 @@ class VLAFlowMatching(nn.Module):
             time = self.sample_time(actions.shape[0], actions.device)
 
         x_t, u_t, _ = make_flow_matching_inputs(actions, noise, time, convention=FlowConvention.NOISE_AT_ONE)
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, spatial_kv = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
@@ -765,6 +784,7 @@ class VLAFlowMatching(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
+            spatial_kv=spatial_kv,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
@@ -793,7 +813,7 @@ class VLAFlowMatching(nn.Module):
         else:
             noise = noise.to(device=device, dtype=torch.float32)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks, spatial_kv = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -814,6 +834,7 @@ class VLAFlowMatching(nn.Module):
                 prefix_pad_masks=prefix_pad_masks,
                 past_key_values=past_key_values,
                 timestep=current_timestep,
+                spatial_kv=spatial_kv,
             ),
             noise,
             num_steps,
@@ -830,6 +851,7 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        spatial_kv: SpatialKV | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
@@ -851,6 +873,7 @@ class VLAFlowMatching(nn.Module):
             past_key_values=past_key_values,
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
+            spatial_kv=spatial_kv,
         )
         if past_key_values is not None:
             # Self-attention layers append suffix K/V in place; restore the prefix for the next step.
