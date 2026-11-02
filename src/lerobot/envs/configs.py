@@ -357,6 +357,9 @@ class LiberoEnv(EnvConfig):
     observation_height: int = 360
     observation_width: int = 360
     is_libero_plus: bool = False
+    # Use the BDDL `(:language ...)` instruction instead of the filename-derived one. Needed for LIBERO-PRO
+    # `*_lan` / `*_task` suites; the original suites' BDDL wording differs from the training-data instructions.
+    language_from_bddl: bool = False
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -444,6 +447,7 @@ class LiberoEnv(EnvConfig):
             "observation_width": self.observation_width,
             "control_freq": self.fps,
             "hard_reset": self.hard_reset,
+            "language_from_bddl": self.language_from_bddl,
         }
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids

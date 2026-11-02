@@ -87,6 +87,17 @@ def get_task_init_states(task_suite: Any, i: int, is_libero_plus: bool = False) 
     return torch.load(init_states_path, weights_only=False)  # nosec B614
 
 
+_BDDL_LANGUAGE_RE = re.compile(r"\(:language\s+(.*?)\)", flags=re.S)
+
+
+def read_bddl_language(bddl_file: str | Path) -> str:
+    """Instruction stored in the `(:language ...)` field of a BDDL problem file."""
+    match = _BDDL_LANGUAGE_RE.search(Path(bddl_file).read_text())
+    if match is None:
+        raise ValueError(f"No `(:language ...)` field in {bddl_file}")
+    return " ".join(match.group(1).split())
+
+
 def get_libero_dummy_action():
     """Get dummy/no-op action, used to roll out the simulation while the robot does nothing."""
     return [0, 0, 0, 0, 0, 0, -1]
@@ -129,6 +140,7 @@ class LiberoEnv(gym.Env):
         control_mode: str = "relative",
         is_libero_plus: bool = False,
         hard_reset: bool = True,
+        language_from_bddl: bool = False,
     ):
         super().__init__()
         if control_freq <= 0:
@@ -177,9 +189,13 @@ class LiberoEnv(gym.Env):
         # Extract task metadata without allocating GPU resources (safe before fork).
         task = task_suite.get_task(task_id)
         self.task = task.name
-        self.task_description = task.language
         self._task_bddl_file = os.path.join(
             get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
+        )
+        # `task.language` is derived from the BDDL filename. Suites that change the instruction but keep the
+        # filename (e.g. LIBERO-PRO `*_lan` paraphrases and `*_task` new goals) only store it in the BDDL file.
+        self.task_description = (
+            read_bddl_language(self._task_bddl_file) if language_from_bddl else task.language
         )
         self._env: OffScreenRenderEnv | None = (
             None  # deferred — created on first reset() inside the worker subprocess
