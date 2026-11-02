@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import copy
-from typing import TYPE_CHECKING
+import math
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from torch import nn
 
 from lerobot.utils.import_utils import _transformers_available, require_package
@@ -71,6 +73,79 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     return hidden_dim
 
 
+class SpatialKV(NamedTuple):
+    """Spatial-bypass keys/values ([B, L, num_kv_heads, head_dim]) and their padding mask ([B, L])."""
+
+    keys: torch.Tensor
+    values: torch.Tensor
+    pad_masks: torch.Tensor
+
+
+class SpatialBypass(nn.Module):
+    """Gated route from the raw SigLIP patches to the action expert's cross-attention layers.
+
+    The connector pixel-shuffles the SigLIP patch grid (32x32 for 512px) down to 8x8 tokens before the VLM.
+    This branch instead average-pools the patches (to 16x16 by default), tags them with a camera embedding and
+    projects them to keys/values shaped like the VLM KV cache. Each expert cross-attention layer attends to them
+    with its own query and adds `tanh(gate) * output` to the attention over the VLM prefix.
+
+    The value projection starts at zero (like LoRA's B or ControlNet's zero convolutions), so a fresh bypass
+    outputs exactly 0 and the policy is exactly the base SmolVLA. Zeroing the gates instead deadlocks training:
+    the K/V projections only get gradients scaled by tanh(gate) ~ 0, and the gates only get gradients from the
+    output of those still-random projections, so neither moves.
+    """
+
+    def __init__(
+        self,
+        vision_hidden_size: int,
+        num_key_value_heads: int,
+        head_dim: int,
+        gated_layers: list[int],
+        num_cameras: int,
+        pool_size: int = 2,
+        gate_init: float = 1.0,
+    ):
+        super().__init__()
+        if gate_init == 0:
+            raise ValueError(
+                "`gate_init` must be non-zero: with zero values and zero gates nothing gets gradients."
+            )
+        self.num_cameras = num_cameras
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.pool_size = pool_size
+        # One gate per expert cross-attention layer: a gate that never reaches the loss breaks DDP
+        self.gate_index = {layer_idx: i for i, layer_idx in enumerate(gated_layers)}
+
+        self.camera_embedding = nn.Parameter(torch.zeros(num_cameras, vision_hidden_size))
+        self.norm = nn.LayerNorm(vision_hidden_size)
+        self.k_proj = nn.Linear(vision_hidden_size, num_key_value_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(vision_hidden_size, num_key_value_heads * head_dim, bias=False)
+        nn.init.zeros_(self.v_proj.weight)
+        self.gates = nn.Parameter(torch.full((len(gated_layers),), gate_init))
+
+    def embed_patches(self, patches: torch.Tensor, camera_idx: int) -> torch.Tensor:
+        """Pool SigLIP patches [B, N, D] on their square grid and add the embedding of camera `camera_idx`."""
+        batch_size, num_patches, dim = patches.shape
+        side = math.isqrt(num_patches)
+        if side * side != num_patches:
+            raise ValueError(f"Expected a square grid of SigLIP patches, got {num_patches} patches.")
+        x = patches.to(dtype=self.camera_embedding.dtype)
+        x = x.transpose(1, 2).reshape(batch_size, dim, side, side)
+        x = F.avg_pool2d(x, kernel_size=self.pool_size)
+        x = x.flatten(2).transpose(1, 2)
+        return x + self.camera_embedding[camera_idx]
+
+    def forward(self, spatial_embs: torch.Tensor, pad_masks: torch.Tensor) -> SpatialKV:
+        """Project the pooled patches of all cameras [B, L, D] once; every denoising step reuses the result."""
+        x = self.norm(spatial_embs)
+        kv_shape = (*x.shape[:2], self.num_key_value_heads, self.head_dim)
+        return SpatialKV(self.k_proj(x).view(kv_shape), self.v_proj(x).view(kv_shape), pad_masks)
+
+    def gate(self, layer_idx: int) -> torch.Tensor:
+        return torch.tanh(self.gates[self.gate_index[layer_idx]])
+
+
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -84,6 +159,10 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        spatial_bypass: bool = False,
+        spatial_pool_size: int = 2,
+        spatial_gate_init: float = 1.0,
+        spatial_num_cameras: int = 1,
     ):
         super().__init__()
         require_package("transformers", extra="smolvla")
@@ -144,10 +223,36 @@ class SmolVLMWithExpertModel(nn.Module):
         self.train_expert_only = train_expert_only
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
+
+        self.spatial_bypass: SpatialBypass | None = None
+        if spatial_bypass:
+            if "cross" not in attention_mode:
+                raise ValueError(f"The spatial bypass needs cross-attention layers, got {attention_mode=}.")
+            expert_layers = self.get_model_layers([self.get_vlm_model().text_model, self.lm_expert])[1]
+            cross_attn_layers = [
+                layer_idx
+                for layer_idx, expert_layer in enumerate(expert_layers)
+                if expert_layer is not None and not self.is_self_attn_layer(layer_idx)
+            ]
+            self.spatial_bypass = SpatialBypass(
+                vision_hidden_size=config.vision_config.hidden_size,
+                num_key_value_heads=config.text_config.num_key_value_heads,
+                head_dim=config.text_config.head_dim,
+                gated_layers=cross_attn_layers,
+                num_cameras=spatial_num_cameras,
+                pool_size=spatial_pool_size,
+                gate_init=spatial_gate_init,
+            )
         self.set_requires_grad()
 
     def get_vlm_model(self):
         return self.vlm.model
+
+    def is_self_attn_layer(self, layer_idx: int) -> bool:
+        """Whether `forward` runs layer `layer_idx` as joint self-attention rather than expert cross-attention."""
+        return "cross" not in self.attention_mode or (
+            self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0
+        )
 
     def set_requires_grad(self):
         if self.freeze_vision_encoder:
@@ -199,10 +304,11 @@ class SmolVLMWithExpertModel(nn.Module):
         if self.train_expert_only:
             self.vlm.eval()
 
-    def embed_image(self, image: torch.Tensor):
+    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
+        """SigLIP patch features [B, num_patches, vision_hidden_size], before the connector's pixel shuffle."""
         patch_attention_mask = None
         # Get sequence from the vision encoder
-        image_hidden_states = (
+        return (
             self.get_vlm_model()
             .vision_model(
                 pixel_values=image.to(dtype=self.get_vlm_model().vision_model.dtype),
@@ -210,9 +316,10 @@ class SmolVLMWithExpertModel(nn.Module):
             )
             .last_hidden_state
         )
+
+    def embed_image(self, image: torch.Tensor):
         # Modality projection & resampling
-        image_hidden_states = self.get_vlm_model().connector(image_hidden_states)
-        return image_hidden_states
+        return self.get_vlm_model().connector(self.encode_image(image))
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.get_vlm_model().text_model.get_input_embeddings()(tokens)
@@ -302,6 +409,7 @@ class SmolVLMWithExpertModel(nn.Module):
         head_dim,
         use_cache: bool = True,
         past_key_values: "DynamicCache | None" = None,
+        spatial_kv: SpatialKV | None = None,
     ) -> "tuple[list[torch.Tensor], DynamicCache | None]":
         attention_interface = self.get_attention_interface()
 
@@ -390,6 +498,22 @@ class SmolVLMWithExpertModel(nn.Module):
                 expert_key_states,
                 expert_value_states,
             )
+            if self.spatial_bypass is not None and spatial_kv is not None:
+                # No RoPE on the query: the SigLIP patches carry their own 2D position embeddings
+                spatial_attention_mask = spatial_kv.pad_masks[:, None, :].expand(
+                    -1, expert_query_state.shape[1], -1
+                )
+                spatial_output = attention_interface(
+                    spatial_attention_mask,
+                    batch_size,
+                    head_dim,
+                    expert_query_state,
+                    spatial_kv.keys,
+                    spatial_kv.values,
+                )
+                att_output = att_output + self.spatial_bypass.gate(layer_idx) * spatial_output.to(
+                    att_output.dtype
+                )
             att_outputs.append(att_output)
         else:
             att_outputs.append(None)
@@ -418,6 +542,7 @@ class SmolVLMWithExpertModel(nn.Module):
         past_key_values: "DynamicCache | None" = None,
         inputs_embeds: list[torch.Tensor | None] | None = None,
         use_cache: bool | None = None,
+        spatial_kv: SpatialKV | None = None,
     ):
         if inputs_embeds is None:
             raise ValueError(
@@ -446,11 +571,7 @@ class SmolVLMWithExpertModel(nn.Module):
         num_layers = self.num_vlm_layers
         head_dim = self.vlm.config.text_config.head_dim
         for layer_idx in range(num_layers):
-            if (
-                fill_kv_cache
-                or "cross" not in self.attention_mode
-                or (self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0)
-            ):
+            if fill_kv_cache or self.is_self_attn_layer(layer_idx):
                 att_outputs, past_key_values = self.forward_attn_layer(
                     model_layers,
                     inputs_embeds,
@@ -473,6 +594,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     head_dim,
                     use_cache=use_cache,
                     past_key_values=past_key_values,
+                    spatial_kv=spatial_kv,
                 )
             outputs_embeds = []
             start = 0

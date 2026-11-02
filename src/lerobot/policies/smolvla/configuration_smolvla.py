@@ -98,6 +98,13 @@ class SmolVLAConfig(PreTrainedConfig):
     self_attn_every_n_layers: int = 2  # Interleave SA layers each self_attn_every_n_layers
     expert_width_multiplier: float = 0.75  # The action expert hidden size (wrt to the VLM)
 
+    # Spatial bypass: the expert's cross-attention layers also attend to pooled SigLIP patches taken before the
+    # connector's pixel shuffle (16x16 instead of 8x8 tokens per 512px camera). Its value projection starts at
+    # zero, so a fresh bypass reproduces the base policy exactly.
+    spatial_bypass: bool = False
+    spatial_pool_size: int = 2  # Average-pooling kernel on the SigLIP patch grid (32x32 -> 16x16 for 512px)
+    spatial_gate_init: float = 1.0  # Per-layer gates scale the bypass output by tanh(gate); must be non-zero
+
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
 
@@ -120,6 +127,18 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.spatial_bypass:
+            if "cross" not in self.attention_mode:
+                raise ValueError(
+                    f"`spatial_bypass` needs cross-attention layers in the expert, got `attention_mode={self.attention_mode}`."
+                )
+            if self.spatial_pool_size < 1:
+                raise ValueError(f"`spatial_pool_size` must be >= 1, got {self.spatial_pool_size}.")
+            if self.spatial_gate_init == 0:
+                raise ValueError(
+                    "`spatial_gate_init` must be non-zero: the bypass values start at zero, so zero gates would "
+                    "leave every bypass parameter without gradients."
+                )
 
     def validate_features(self) -> None:
         if self.input_features is None:
@@ -131,6 +150,13 @@ class SmolVLAConfig(PreTrainedConfig):
                 shape=(3, 480, 640),
             )
             self.input_features[key] = empty_camera
+        if self.spatial_bypass and self.num_spatial_cameras < 1:
+            raise ValueError("`spatial_bypass` needs at least one image feature besides the empty cameras.")
+
+    @property
+    def num_spatial_cameras(self) -> int:
+        """Cameras fed to the spatial bypass: `prepare_images` appends the (always masked) empty cameras last."""
+        return len(self.image_features) - self.empty_cameras
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
