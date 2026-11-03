@@ -21,7 +21,10 @@ import torch
 from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
+    TokenizerProcessorStep,
+    make_default_policy_processor_steps,
     make_default_pre_post_processors,
+    make_policy_processor_pipelines,
 )
 
 from .configuration_diffusion import DiffusionConfig
@@ -41,7 +44,8 @@ def make_diffusion_pre_post_processors(
     1. Renaming features.
     2. Normalizing the input and output features based on dataset statistics.
     3. Adding a batch dimension.
-    4. Moving the data to the specified device.
+    4. Tokenizing the task instruction with the CLIP tokenizer (only with `use_language`).
+    5. Moving the data to the specified device.
 
     The post-processing pipeline handles the model's output by:
     1. Moving the data to the CPU.
@@ -56,4 +60,21 @@ def make_diffusion_pre_post_processors(
     Returns:
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
-    return make_default_pre_post_processors(config, dataset_stats)
+    if not config.use_language:
+        return make_default_pre_post_processors(config, dataset_stats)
+
+    steps = make_default_policy_processor_steps(config, dataset_stats)
+    input_steps = [
+        steps.rename_observations,
+        steps.add_batch_dim,
+        TokenizerProcessorStep(
+            tokenizer_name=config.text_encoder_name,
+            max_length=config.tokenizer_max_length,
+            padding="max_length",
+            padding_side="right",
+        ),
+        steps.to_device,
+        steps.normalize,
+    ]
+    output_steps = [steps.unnormalize, steps.to_cpu]
+    return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)

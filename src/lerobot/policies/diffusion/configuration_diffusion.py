@@ -69,6 +69,12 @@ class DiffusionConfig(PreTrainedConfig):
             The group sizes are set to be about 16 (to be precise, feature_dim // 16).
         spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
         use_separate_rgb_encoder_per_camera: Whether to use a separate RGB encoder for each camera view.
+        use_language: Whether to condition on the task instruction, for multi-task datasets such as LIBERO.
+            The preprocessor tokenizes the `task` string, a frozen CLIP text model encodes it, and a learnable
+            projection of its pooled output is appended to the global conditioning.
+        text_encoder_name: Hugging Face CLIP model whose tokenizer and text encoder are used.
+        text_embed_dim: Output dimension of the learnable projection of the CLIP text features.
+        tokenizer_max_length: Maximum number of tokens of the instruction (CLIP's limit is 77).
         down_dims: Feature dimension for each stage of temporal downsampling in the diffusion modeling Unet.
             You may provide a variable number of dimensions, therefore also controlling the degree of
             downsampling.
@@ -128,6 +134,11 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = False
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = True
+    # Language conditioning.
+    use_language: bool = False
+    text_encoder_name: str = "openai/clip-vit-base-patch32"
+    text_embed_dim: int = 512
+    tokenizer_max_length: int = 77
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5

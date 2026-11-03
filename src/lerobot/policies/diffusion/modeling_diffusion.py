@@ -33,8 +33,15 @@ import torchvision
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
-from lerobot.utils.import_utils import _diffusers_available, require_package
+from lerobot.utils.constants import (
+    ACTION,
+    OBS_ENV_STATE,
+    OBS_IMAGES,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
+)
+from lerobot.utils.import_utils import _diffusers_available, _transformers_available, require_package
 
 if TYPE_CHECKING or _diffusers_available:
     from diffusers.schedulers.scheduling_ddim import DDIMScheduler
@@ -51,6 +58,11 @@ from ..utils import (
     populate_queues,
 )
 from .configuration_diffusion import DiffusionConfig
+
+if TYPE_CHECKING or _transformers_available:
+    from ..multi_task_dit.modeling_multi_task_dit import CLIPTextEncoder
+else:
+    CLIPTextEncoder = None
 
 
 class DiffusionPolicy(PreTrainedPolicy):
@@ -113,7 +125,10 @@ class DiffusionPolicy(PreTrainedPolicy):
         """
         queues_populated = any(len(q) > 0 for q in self._queues.values())
         if queues_populated:
+            # The instruction is not queued: it is the same for every observation step
+            language = {k: batch[k] for k in (OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK) if k in batch}
             batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+            batch.update(language)
         else:
             batch = dict(batch)
             if self.config.image_features:
@@ -226,7 +241,14 @@ class DiffusionModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        global_cond_dim *= config.n_obs_steps
+        self.text_encoder: CLIPTextEncoder | None = None
+        if config.use_language:
+            require_package("transformers", extra="transformers-dep")
+            self.text_encoder = CLIPTextEncoder(config.text_encoder_name, config.text_embed_dim)
+            global_cond_dim += config.text_embed_dim
+
+        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim)
 
         if config.compile_model:
             # Compile the U-Net. "reduce-overhead" is preferred for the small-batch repetitive loops
@@ -322,7 +344,11 @@ class DiffusionModel(nn.Module):
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
         # Concatenate features then flatten to (B, global_cond_dim).
-        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+        global_cond = torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+        if self.text_encoder is not None:
+            text_features = self.text_encoder(batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK])
+            global_cond = torch.cat([global_cond, text_features], dim=-1)
+        return global_cond
 
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """

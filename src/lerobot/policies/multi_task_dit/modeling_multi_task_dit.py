@@ -253,6 +253,8 @@ class CLIPTextEncoder(nn.Module):
 
         for param in self.text_encoder.parameters():
             param.requires_grad = False
+            # transformers loads q/k/v as views of one fused tensor, which safetensors refuses to load into
+            param.data = param.data.clone()
 
         self.text_embed_dim = self.text_encoder.config.hidden_size
         self.projection = nn.Linear(self.text_embed_dim, projection_dim)
