@@ -48,6 +48,7 @@ from .rtc import (
     validate_trained_rtc_horizon,
 )
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
+from .smolvla_control.configuration_smolvla_control import SmolVLAControlConfig as SmolVLAControlConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .utils import make_robot_action, prepare_observation_for_inference
 from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig as VLAJEPAConfig
@@ -82,6 +83,7 @@ __all__ = [
     "PI0FastConfig",
     "PI05Config",
     "SmolVLAConfig",
+    "SmolVLAControlConfig",
     "TDMPCConfig",
     "VLAJEPAConfig",
     "VQBeTConfig",

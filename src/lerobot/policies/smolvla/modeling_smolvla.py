@@ -166,8 +166,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         self.init_rtc_processor()
-        self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
+        self.model = self._build_model()
         self.reset()
+
+    def _build_model(self) -> "VLAFlowMatching":
+        """Build the core flow-matching model; subclasses override it to extend the model."""
+        return VLAFlowMatching(self.config, rtc_processor=self.rtc_processor)
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -647,9 +651,9 @@ class VLAFlowMatching(nn.Module):
             else:
                 img_emb = self.vlm_with_expert.embed_image(img)
 
-            # Normalize image embeddings
-            img_emb_dim = img_emb.shape[-1]
-            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+            if self.config.scale_prefix_embeddings:
+                img_emb_dim = img_emb.shape[-1]
+                img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
 
             bsize, num_img_embs = img_emb.shape[:2]
             img_mask = img_mask[:, None].expand(bsize, num_img_embs)
@@ -673,9 +677,8 @@ class VLAFlowMatching(nn.Module):
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
-        # Normalize language embeddings
-        lang_emb_dim = lang_emb.shape[-1]
-        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+        if self.config.scale_prefix_embeddings:
+            lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)

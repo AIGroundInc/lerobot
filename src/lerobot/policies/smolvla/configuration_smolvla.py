@@ -86,6 +86,11 @@ class SmolVLAConfig(PreTrainedConfig):
     load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
 
     add_image_special_tokens: bool = False  # Whether to use special image tokens around image features.
+    # Multiply the image and language embeddings by sqrt(hidden_size) before the VLM, as Gemma does (inherited from
+    # pi0). SmolVLM's Llama text model does not scale its embeddings, and the scaling weakens the frozen VLM's
+    # word -> image-region attention, so set it to False for SmolVLM inputs as the VLM was trained on. Pretrained
+    # SmolVLA checkpoints were trained with True.
+    scale_prefix_embeddings: bool = True
 
     attention_mode: str = "cross_attn"
 
